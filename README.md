@@ -60,5 +60,3 @@ The app’s current Firestore event writes do not trigger Render automatically. 
 ## Repository notes
 
 `GoogleService-Info.plist`, Xcode user data, build output, local Firebase state, Node dependencies, and common signing or service-account credentials are excluded by `.gitignore`. Commit the Firebase rules, indexes, `firebase.json`, and Node package lockfile so the project setup can be reproduced.
-
-Do not commit APNs `.p8` keys, Firebase Admin service-account files, FCM device tokens copied from logs, or other private credentials.
