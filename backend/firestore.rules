@@ -1,0 +1,411 @@
+rules_version = '2';
+
+// Along Firestore rules for Firebase Spark. Group membership is approved by
+// the group owner through an atomic Firestore batch; no Cloud Functions needed.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function groupPath(groupId) {
+      return /databases/$(database)/documents/groups/$(groupId);
+    }
+
+    function memberPath(groupId, uid) {
+      return /databases/$(database)/documents/groups/$(groupId)/members/$(uid);
+    }
+
+    function requestPath(groupId, uid) {
+      return /databases/$(database)/documents/groups/$(groupId)/joinRequests/$(uid);
+    }
+
+    function isMember(groupId) {
+      return signedIn() && exists(memberPath(groupId, request.auth.uid));
+    }
+
+    function isOwner(groupId) {
+      return isMember(groupId)
+        && get(memberPath(groupId, request.auth.uid)).data.role == 'owner';
+    }
+
+    function onlyRemovesSelf(before, after) {
+      return request.auth.uid in before
+        && !(request.auth.uid in after)
+        && before.toSet().difference(after.toSet()).hasOnly([request.auth.uid])
+        && after.toSet().difference(before.toSet()).size() == 0;
+    }
+
+    function onlyRemovesUid(before, after, uid) {
+      return uid in before
+        && !(uid in after)
+        && before.toSet().difference(after.toSet()).hasOnly([uid])
+        && after.toSet().difference(before.toSet()).size() == 0;
+    }
+
+    function onlyAddsUid(before, after, uid) {
+      return !(uid in before)
+        && uid in after
+        && after.toSet().difference(before.toSet()).hasOnly([uid])
+        && before.toSet().difference(after.toSet()).size() == 0;
+    }
+
+    // ---------------- users ----------------
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'displayName', 'email', 'createdAt', 'updatedAt',
+          'notificationsEnabled', 'fcmTokens'
+        ])
+        && request.resource.data.keys().hasAll([
+          'displayName', 'email', 'createdAt', 'updatedAt', 'notificationsEnabled'
+        ])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() > 0
+        && request.resource.data.displayName.size() <= 60
+        && request.resource.data.email is string
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && request.resource.data.notificationsEnabled is bool
+        && (!('fcmTokens' in request.resource.data)
+            || request.resource.data.fcmTokens is list);
+
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'updatedAt', 'notificationsEnabled', 'fcmTokens'
+        ])
+        && (!('displayName' in request.resource.data)
+            || (request.resource.data.displayName is string
+                && request.resource.data.displayName.size() > 0
+                && request.resource.data.displayName.size() <= 60))
+        && (!('updatedAt' in request.resource.data)
+            || request.resource.data.updatedAt is timestamp)
+        && (!('notificationsEnabled' in request.resource.data)
+            || request.resource.data.notificationsEnabled is bool)
+        && (!('fcmTokens' in request.resource.data)
+            || request.resource.data.fcmTokens is list);
+
+      allow delete: if false;
+    }
+
+    // ---------------- groups ----------------
+    match /groups/{groupId} {
+      // This matches the app's memberIds arrayContains group query.
+      allow read: if signedIn()
+        && request.auth.uid in resource.data.memberIds;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'name', 'createdBy', 'memberIds', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.memberIds == [request.auth.uid]
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp;
+
+      allow update: if isMember(groupId)
+        && (
+          // A member leaves. The existing owner may transfer ownership as
+          // part of the same batch when they leave.
+          (
+            request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['memberIds', 'updatedAt', 'createdBy'])
+            && onlyRemovesSelf(resource.data.memberIds, request.resource.data.memberIds)
+            && !existsAfter(memberPath(groupId, request.auth.uid))
+            && request.resource.data.updatedAt is timestamp
+            && (
+              request.resource.data.createdBy == resource.data.createdBy
+              || (
+                isOwner(groupId)
+                && request.resource.data.createdBy in request.resource.data.memberIds
+              )
+            )
+          )
+          ||
+          // The owner removes one or more other members.
+          (
+            isOwner(groupId)
+            && request.auth.uid in request.resource.data.memberIds
+            && request.resource.data.createdBy == resource.data.createdBy
+            && request.resource.data.updatedAt is timestamp
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['memberIds', 'updatedAt', 'lastRemovedUid'])
+            && request.resource.data.lastRemovedUid is string
+            && onlyRemovesUid(
+              resource.data.memberIds,
+              request.resource.data.memberIds,
+              request.resource.data.lastRemovedUid
+            )
+            && !existsAfter(memberPath(groupId, request.resource.data.lastRemovedUid))
+          )
+          ||
+          // The owner approves exactly one pending request in the same batch
+          // that creates the member document and updates memberIds.
+          (
+            isOwner(groupId)
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['memberIds', 'updatedAt', 'lastApprovedUid'])
+            && request.resource.data.updatedAt is timestamp
+            && request.resource.data.lastApprovedUid is string
+            && onlyAddsUid(
+              resource.data.memberIds,
+              request.resource.data.memberIds,
+              request.resource.data.lastApprovedUid
+            )
+            && get(requestPath(groupId, request.resource.data.lastApprovedUid)).data.status == 'pending'
+            && getAfter(requestPath(groupId, request.resource.data.lastApprovedUid)).data.status == 'approved'
+            && getAfter(requestPath(groupId, request.resource.data.lastApprovedUid)).data.reviewedBy == request.auth.uid
+            && getAfter(memberPath(groupId, request.resource.data.lastApprovedUid)).data.role == 'member'
+          )
+        );
+
+      allow delete: if isOwner(groupId);
+
+      // ---------------- members ----------------
+      match /members/{uid} {
+        allow read: if isMember(groupId);
+
+        // Initial owner member is created atomically with the group.
+        allow create: if (
+            signedIn()
+            && request.auth.uid == uid
+            && request.resource.data.keys().hasOnly([
+              'role', 'displayName', 'joinedAt', 'sharingEnabled'
+            ])
+            && request.resource.data.keys().hasAll([
+              'role', 'displayName', 'joinedAt', 'sharingEnabled'
+            ])
+            && request.resource.data.role == 'owner'
+            && request.resource.data.displayName is string
+            && request.resource.data.displayName.size() > 0
+            && request.resource.data.displayName.size() <= 60
+            && request.resource.data.joinedAt is timestamp
+            && request.resource.data.sharingEnabled == false
+            && getAfter(groupPath(groupId)).data.createdBy == request.auth.uid
+            && getAfter(groupPath(groupId)).data.memberIds == [request.auth.uid]
+          ) || (
+            // Owner-approved join request. The requester cannot add themselves.
+            signedIn()
+            && isOwner(groupId)
+            && request.resource.data.role == 'member'
+            && request.resource.data.keys().hasOnly([
+              'role', 'displayName', 'joinedAt', 'sharingEnabled'
+            ])
+            && request.resource.data.keys().hasAll([
+              'role', 'displayName', 'joinedAt', 'sharingEnabled'
+            ])
+            && request.resource.data.displayName is string
+            && request.resource.data.displayName.size() > 0
+            && request.resource.data.displayName.size() <= 60
+            && request.resource.data.joinedAt is timestamp
+            && request.resource.data.sharingEnabled == false
+            && get(requestPath(groupId, uid)).data.status == 'pending'
+            && request.resource.data.displayName
+              == get(requestPath(groupId, uid)).data.displayName
+            && getAfter(requestPath(groupId, uid)).data.status == 'approved'
+            && getAfter(requestPath(groupId, uid)).data.reviewedBy == request.auth.uid
+            && getAfter(groupPath(groupId)).data.lastApprovedUid == uid
+            && uid in getAfter(groupPath(groupId)).data.memberIds
+          );
+
+        allow update: if isMember(groupId)
+          && (
+            (
+              request.auth.uid == uid
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['sharingEnabled'])
+              && request.resource.data.sharingEnabled is bool
+            )
+            || (
+              isOwner(groupId)
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['role'])
+              && request.resource.data.role == 'owner'
+              && getAfter(groupPath(groupId)).data.createdBy == uid
+              && !(request.auth.uid in getAfter(groupPath(groupId)).data.memberIds)
+            )
+          );
+
+        allow delete: if isMember(groupId)
+          && (request.auth.uid == uid || isOwner(groupId));
+      }
+
+      // ---------------- join requests ----------------
+      match /joinRequests/{uid} {
+        allow get: if signedIn()
+          && (request.auth.uid == uid || isOwner(groupId));
+        allow list: if isOwner(groupId);
+
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['displayName', 'requestedAt', 'status'])
+          && request.resource.data.displayName is string
+          && request.resource.data.displayName.size() > 0
+          && request.resource.data.displayName.size() <= 60
+          && request.resource.data.requestedAt is timestamp
+          && request.resource.data.status == 'pending'
+          && exists(groupPath(groupId))
+          && !(request.auth.uid in get(groupPath(groupId)).data.memberIds)
+          && !exists(memberPath(groupId, uid));
+
+        allow update: if signedIn()
+          && (
+            // A rejected requester may submit again.
+            (
+              request.auth.uid == uid
+              && resource.data.status == 'rejected'
+              && request.resource.data.status == 'pending'
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['displayName', 'requestedAt', 'status', 'reviewedAt', 'reviewedBy'])
+              && request.resource.data.keys().hasOnly([
+                'displayName', 'requestedAt', 'status'
+              ])
+              && request.resource.data.displayName is string
+              && request.resource.data.displayName.size() > 0
+              && request.resource.data.displayName.size() <= 60
+              && request.resource.data.requestedAt is timestamp
+              && !('reviewedAt' in request.resource.data)
+              && !('reviewedBy' in request.resource.data)
+            )
+            ||
+            // Only the owner may approve or reject a pending request.
+            (
+              isOwner(groupId)
+              && resource.data.status == 'pending'
+              && request.resource.data.status in ['approved', 'rejected']
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['status', 'reviewedAt', 'reviewedBy'])
+              && request.resource.data.reviewedAt is timestamp
+              && request.resource.data.reviewedBy == request.auth.uid
+              && (
+                request.resource.data.status == 'rejected'
+                || (
+                  getAfter(groupPath(groupId)).data.lastApprovedUid == uid
+                  && uid in getAfter(groupPath(groupId)).data.memberIds
+                  && getAfter(memberPath(groupId, uid)).data.role == 'member'
+                )
+              )
+            )
+          );
+
+        allow delete: if signedIn()
+          && (request.auth.uid == uid || isOwner(groupId));
+      }
+
+      // ---------------- locations ----------------
+      match /locations/{uid} {
+        allow read: if isMember(groupId);
+
+        allow create, update: if isMember(groupId)
+          && request.auth.uid == uid
+          && get(memberPath(groupId, uid)).data.sharingEnabled == true
+          && request.resource.data.keys().hasOnly([
+            'latitude', 'longitude', 'horizontalAccuracy', 'updatedAt'
+          ])
+          && request.resource.data.latitude is number
+          && request.resource.data.latitude >= -90
+          && request.resource.data.latitude <= 90
+          && request.resource.data.longitude is number
+          && request.resource.data.longitude >= -180
+          && request.resource.data.longitude <= 180
+          && request.resource.data.horizontalAccuracy is number
+          && request.resource.data.horizontalAccuracy >= 0
+          && request.resource.data.horizontalAccuracy <= 100
+          && request.resource.data.updatedAt is timestamp;
+
+        allow delete: if isMember(groupId)
+          && (request.auth.uid == uid || isOwner(groupId));
+      }
+
+      // ---------------- saved places ----------------
+      match /savedPlaces/{placeId} {
+        allow read: if isMember(groupId);
+
+        allow create: if isMember(groupId)
+          && request.resource.data.keys().hasOnly([
+            'name', 'latitude', 'longitude', 'radius',
+            'createdBy', 'enabled', 'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'name', 'latitude', 'longitude', 'radius',
+            'createdBy', 'enabled', 'createdAt'
+          ])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 60
+          && request.resource.data.latitude is number
+          && request.resource.data.latitude >= -90
+          && request.resource.data.latitude <= 90
+          && request.resource.data.longitude is number
+          && request.resource.data.longitude >= -180
+          && request.resource.data.longitude <= 180
+          && request.resource.data.radius is number
+          && request.resource.data.radius >= 50
+          && request.resource.data.radius <= 2000
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.enabled == true
+          && request.resource.data.createdAt is timestamp;
+
+        allow update: if isMember(groupId)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['name', 'radius', 'enabled', 'latitude', 'longitude'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 60
+          && request.resource.data.latitude is number
+          && request.resource.data.latitude >= -90
+          && request.resource.data.latitude <= 90
+          && request.resource.data.longitude is number
+          && request.resource.data.longitude >= -180
+          && request.resource.data.longitude <= 180
+          && request.resource.data.radius is number
+          && request.resource.data.radius >= 50
+          && request.resource.data.radius <= 2000
+          && request.resource.data.enabled is bool;
+
+        allow delete: if isMember(groupId)
+          && (resource.data.createdBy == request.auth.uid || isOwner(groupId));
+      }
+
+      // ---------------- activity events ----------------
+      match /events/{eventId} {
+        allow read: if isMember(groupId);
+
+        allow create: if isMember(groupId)
+          && request.resource.data.keys().hasOnly([
+            'type', 'memberUid', 'memberName', 'placeId', 'placeName',
+            'timestamp', 'source', 'deduplicationKey'
+          ])
+          && request.resource.data.keys().hasAll([
+            'type', 'memberUid', 'memberName', 'timestamp', 'source', 'deduplicationKey'
+          ])
+          && request.resource.data.memberUid == request.auth.uid
+          && request.resource.data.memberName is string
+          && request.resource.data.memberName.size() <= 60
+          && request.resource.data.type in [
+            'arrived', 'departed', 'groupCreated', 'memberLeft',
+            'sharingStarted', 'sharingPaused'
+          ]
+          && request.resource.data.source == 'device'
+          && request.resource.data.timestamp is timestamp
+          && request.resource.data.deduplicationKey is string
+          && request.resource.data.deduplicationKey == eventId
+          && (!('placeId' in request.resource.data)
+              || request.resource.data.placeId is string)
+          && (!('placeName' in request.resource.data)
+              || request.resource.data.placeName is string);
+
+        allow update: if false;
+        allow delete: if isOwner(groupId);
+      }
+    }
+  }
+}

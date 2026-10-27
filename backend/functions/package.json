@@ -1,0 +1,11 @@
+{
+  "name": "along-functions",
+  "description": "Trusted server-side operations for Along (invites, cleanup).",
+  "engines": { "node": "20" },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.1.0"
+  },
+  "private": true
+}

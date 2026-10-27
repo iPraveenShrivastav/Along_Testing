@@ -1,0 +1,49 @@
+# Xcode build products and local workspace state
+build/
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+xcuserdata/
+
+# macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Firebase local state and logs
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+*.log
+
+# Firebase app configuration: retrieve this file from Firebase Console per setup guide
+/assignment/GoogleService-Info.plist
+
+# Firebase Admin credentials and local secrets
+*service-account*.json
+*serviceAccount*.json
+*-firebase-adminsdk-*.json
+AuthKey_*.p8
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
+!.env.example
+functions/.runtimeconfig.json
+functions/.secret.local
+backend/functions/.runtimeconfig.json
+backend/functions/.secret.local
+
+# Node dependencies and generated output
+node_modules/
+backend/functions/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
